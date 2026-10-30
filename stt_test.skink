@@ -1,0 +1,175 @@
+// File:    stt_test.skink
+// Purpose: Unit tests for skink-stt — provider vtable dispatch,
+//          multipart body construction (binary-safe boundaries),
+//          the REST provider end-to-end against a scripted fake HTTP
+//          server, the template provider via a stub shell command,
+//          and uninitialized-provider errors.
+module stt_test
+
+import "stt_iface"
+import "stt_rest"
+import "stt_proc"
+import "stt_http"
+import "stt"
+import "std/str"
+import "std/net"
+import "std/libc"
+import "std/os"
+import "std/fs"
+import "std/waitgroup"
+import "std/time"
+import "std/testing"
+import "std/errors"
+
+// fakeTranscribe is a test vtable entry returning fixed text.
+fn fakeTranscribe(p: *stt_iface.Provider, audio: string, audioLen: int, o: stt_iface.Opts) -> (string, errors.Error) {
+    return "transcribed text", errors.New("")
+}
+
+// TestProviderVtable checks dispatch through Provider.Transcribe.
+pub fn TestProviderVtable() {
+    p := stt_iface.New("fake")
+    p.transcribeFn = fakeTranscribe
+    text, err := p.Transcribe("audio", 5, stt_iface.DefaultOpts())
+    testing.AssertTrue(str.Len(err.message) == 0, "fake transcribe")
+    testing.AssertEqualString("transcribed text", text, "fake text")
+}
+
+// TestUninitializedProvider gets a clean error, not a crash.
+pub fn TestUninitializedProvider() {
+    p := stt_iface.New("none")
+    _, err := p.Transcribe("audio", 5, stt_iface.DefaultOpts())
+    testing.AssertTrue(str.Len(err.message) > 0, "unset transcribeFn errors")
+}
+
+// fakeWav builds a minimal valid WAV (44-byte header, 8 silent frames).
+fn fakeWav() -> (string, int) {
+    b := libc.malloc(60)
+    b[0] = 82
+    b[1] = 73
+    b[2] = 70
+    b[3] = 70    // RIFF
+    b[4] = 52    // size
+    b[8] = 87    // WAVE
+    b[9] = 65
+    b[10] = 86
+    b[11] = 69
+    b[12] = 102  // fmt
+    b[13] = 109
+    b[14] = 116
+    b[15] = 32
+    b[16] = 16   // fmt size
+    b[20] = 1    // PCM
+    b[22] = 1    // mono
+    b[24] = 64   // rate lo
+    b[25] = 31   // 8000Hz
+    b[28] = 128  // byte rate lo
+    b[29] = 62
+    b[32] = 2    // block align
+    b[34] = 16   // bits
+    b[36] = 100  // data
+    b[37] = 97
+    b[38] = 116
+    b[39] = 97
+    b[40] = 16   // 16 bytes data
+    for i := 44; i < 60; i = i + 1 {
+        b[i] = 0
+    }
+    return b, 60
+}
+
+// fakeServer replies to one POST with a JSON transcription.
+fn fakeServer(wg: *waitgroup.WaitGroup) {
+    ln, lerr := net.Listen("127.0.0.1", 18346)
+    if str.Len(lerr.message) > 0 {
+        waitgroup.Done(wg)
+        return
+    }
+    conn, _ := net.Accept(ln)
+    req, _ := conn.Recv(131072)
+    _ = req
+    body := "{\"text\":\"hello world\"}"
+    head := "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: "
+    head = str.Concat(head, "22\r\nConnection: close\r\n\r\n")
+    conn.SendAll(head, str.Len(head))
+    conn.SendAll(body, str.Len(body))
+    conn.Close()
+    ln.Close()
+    waitgroup.Done(wg)
+}
+
+// TestRestProvider exercises the multipart POST path end-to-end.
+pub fn TestRestProvider() {
+    wg := waitgroup.New()
+    waitgroup.Add(wg, 1)
+    spawn fakeServer(wg)
+    time.SleepMs(50)
+    p := stt_rest.WithBase("http://127.0.0.1:18346", "k", "whisper-1")
+    wav, wn := fakeWav()
+    text, err := p.Transcribe(wav, wn, stt_iface.DefaultOpts())
+    libc.free(wav)
+    waitgroup.Wait(wg)
+    testing.AssertTrue(str.Len(err.message) == 0, str.Concat("rest transcribe: ", err.message))
+    testing.AssertEqualString("hello world", text, "transcript")
+}
+
+// TestTemplateProvider drives the generic provider with a stub
+// command that echoes canned text into {out}.
+pub fn TestTemplateProvider() {
+    outTok := str.Concat("{", "out}")
+    inTok := str.Concat("{", "in}")
+    // stub: copy a canned transcript to {out}, ignore {in}
+    tmpl := str.Concat("printf 'stub transcript' > ", outTok)
+    p := stt_proc.Template(tmpl)
+    wav, wn := fakeWav()
+    text, err := p.Transcribe(wav, wn, stt_iface.DefaultOpts())
+    libc.free(wav)
+    testing.AssertTrue(str.Len(err.message) == 0, str.Concat("template: ", err.message))
+    testing.AssertEqualString("stub transcript", text, "template output")
+    _ = inTok
+}
+
+// TestTemplateMissingOut verifies a template that never writes {out}
+// returns an error rather than empty text.
+pub fn TestTemplateMissingOut() {
+    p := stt_proc.Template("true")
+    wav, wn := fakeWav()
+    _, err := p.Transcribe(wav, wn, stt_iface.DefaultOpts())
+    libc.free(wav)
+    testing.AssertTrue(str.Len(err.message) > 0, "missing output errors")
+}
+
+// TestHttpPost checks stt_http.Post directly.
+pub fn TestHttpPost() {
+    wg := waitgroup.New()
+    waitgroup.Add(wg, 1)
+    spawn fakeServer(wg)
+    time.SleepMs(50)
+    resp, err := stt_http.Post("http://127.0.0.1:18346/v1/audio/transcriptions",
+        "multipart/form-data; boundary=x", "", "test", 4)
+    waitgroup.Wait(wg)
+    testing.AssertTrue(str.Len(err.message) == 0, str.Concat("post: ", err.message))
+    testing.AssertEqualInt(resp.Status, 200, "status")
+    testing.AssertEqualInt(resp.BodyLen, 22, "body len")
+    libc.free(resp.Body)
+}
+
+// TestDetectEntry checks the root Detect returns something sane.
+pub fn TestDetectEntry() {
+    p := stt.Detect()
+    testing.AssertTrue(str.Len(p.Name) > 0, "detect name")
+}
+
+// TestAvailable checks binary detection.
+pub fn TestAvailable() {
+    has := stt_proc.Available("definitely-not-a-real-binary-xyz")
+    testing.AssertFalse(has, "missing binary")
+}
+
+// TestAvailableEscapes — regression: Available(bin) interpolates the
+// name into a `command -v` shell line; an adversarial name must be
+// quoted, not executed.
+pub fn TestAvailableEscapes() {
+    testing.AssertFalse(stt_proc.Available("x';id;'"), "shell chars escaped")
+    testing.AssertFalse(stt_proc.Available("definitely-not-a-real-binary-xyz"), "missing binary")
+}

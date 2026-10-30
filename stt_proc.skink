@@ -1,0 +1,225 @@
+// File:    stt_proc.skink
+// Purpose: Subprocess STT providers for skink-stt — offline engines
+//          run as child processes. whisper.cpp's whisper-cli reads a
+//          WAV file and emits text (-otxt writes <wav>.txt). A generic
+//          Template provider covers vosk wrappers and any CLI taking
+//          {in}=audio path / {out}=transcript path.
+module stt_proc
+
+import "std/str"
+import "std/strconv"
+import "std/os"
+import "std/fs"
+import "std/rand"
+import "std/errors"
+import "std/libc"
+import "stt_iface"
+
+extern fn getpid() -> int
+
+// pcfg holds subprocess provider config behind Provider.State.
+struct pcfg {
+    style: int      // 0=whisper-cli, 1=template
+    bin:   string   // whisper: executable (whisper-cli or main)
+    model: string   // whisper: model path (ggml *.bin)
+    tmpl:  string   // template: command line with {in}/{out} slots
+}
+
+var procBoxes map[int][]pcfg
+var procNext = 1
+
+const STYLE_WHISPER  = 0
+const STYLE_TEMPLATE = 1
+
+// Whisper creates a provider for whisper.cpp's whisper-cli (or `main`
+// in older builds — pass the name explicitly via WhisperBin).
+// model is the ggml file, e.g. models/ggml-base.en.bin.
+pub fn Whisper(model: string) -> stt_iface.Provider {
+    return WhisperBin("whisper-cli", model)
+}
+
+// WhisperBin creates a whisper.cpp provider with a custom binary name.
+pub fn WhisperBin(bin: string, model: string) -> stt_iface.Provider {
+    return mkProc(STYLE_WHISPER, bin, model, "")
+}
+
+// Template creates a provider from a command template. `{in}` expands
+// to the (shell-escaped) audio path; `{out}` to the transcript path
+// the command must write. Example for a vosk wrapper:
+//   Template("python3 /opt/vosk-stt.py --audio {in} --out {out}")
+pub fn Template(tmpl: string) -> stt_iface.Provider {
+    return mkProc(STYLE_TEMPLATE, "", "", tmpl)
+}
+
+// Available reports whether a binary exists on PATH.
+pub fn Available(bin: string) -> bool {
+    out, _ := os.RunWithOutput(str.Concat("command -v ", shellEsc(bin)))
+    return str.Len(str.Trim(out)) > 0
+}
+
+// DetectProc returns a whisper.cpp provider when whisper-cli (or a
+// whisper.cpp `main` binary) is on PATH and STT_WHISPER_MODEL points
+// at a model file; otherwise a "none" provider.
+pub fn DetectProc() -> stt_iface.Provider {
+    model := os.Getenv("STT_WHISPER_MODEL")
+    if str.Len(model) > 0 {
+        if Available("whisper-cli") {
+            return Whisper(model)
+        }
+        if Available("whisper.cpp") {
+            return WhisperBin("whisper.cpp", model)
+        }
+    }
+    return stt_iface.New("none")
+}
+
+// mkProc boxes a pcfg and builds the Provider.
+fn mkProc(style: int, bin: string, model: string, tmpl: string) -> stt_iface.Provider {
+    if procBoxes == nil {
+        procBoxes = make(map[int][]pcfg)
+    }
+    s := make([]pcfg, 1)
+    s[0] = pcfg{style: style, bin: bin, model: model, tmpl: tmpl}
+    h := procNext
+    procNext = procNext + 1
+    procBoxes[h] = s
+    p := stt_iface.New(bin)
+    if style == STYLE_TEMPLATE {
+        p.Name = "template"
+    }
+    p.State = int64(h)
+    p.transcribeFn = procTranscribe
+    return p
+}
+
+// shellEsc wraps a string in single quotes, escaping embedded ones.
+fn shellEsc(s: string) -> string {
+    out := "'"
+    n := str.Len(s)
+    for i := 0; i < n; i = i + 1 {
+        if s[i] == 39 {
+            out = str.Concat(out, "'\\''")
+        } else {
+            out = str.Concat(out, str.Substr(s, i, 1))
+        }
+    }
+    return str.Concat(out, "'")
+}
+
+// readAll slurps a whole file into malloc'd bytes.
+fn readAll(path: string) -> (string, int, errors.Error) {
+    size := int(fs.FileSize(path))
+    f, ferr := fs.Open(path, "rb")
+    if str.Len(ferr.message) > 0 {
+        return "", 0, ferr
+    }
+    data := libc.malloc(size + 1)
+    got := 0
+    for got < size {
+        n := f.Read(string(int64(data) + int64(got)), size - got)
+        if n <= 0 {
+            break
+        }
+        got = got + n
+    }
+    f.Close()
+    data[got] = 0
+    return data, got, errors.New("")
+}
+
+// trimResult strips whisper-cli's timestamp prefixes like
+// [00:00:00.000 --> 00:00:02.000]   text  — keeps only the text part.
+fn trimResult(s: string) -> string {
+    out := ""
+    n := str.Len(s)
+    i := 0
+    for i < n {
+        // skip a leading "[...]" stamp
+        if s[i] == 91 {
+            for i < n && s[i] != 93 {
+                i = i + 1
+            }
+            i = i + 1   // skip ]
+            for i < n && (s[i] == 32 || s[i] == 9) {
+                i = i + 1
+            }
+        }
+        // copy to end-of-line
+        lineStart := i
+        for i < n && s[i] != 10 {
+            i = i + 1
+        }
+        line := str.Substr(s, lineStart, i - lineStart)
+        if str.Len(str.Trim(line)) > 0 {
+            if str.Len(out) > 0 {
+                out = str.Concat(out, " ")
+            }
+            out = str.Concat(out, str.Trim(line))
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// procTranscribe writes audio to a temp WAV, runs the engine, and
+// reads back the transcript.
+fn procTranscribe(p: *stt_iface.Provider, audio: string, audioLen: int, o: stt_iface.Opts) -> (string, errors.Error) {
+    c := &procBoxes[int(p.State)][0]
+    pid := strconv.Itoa(getpid())
+    wavPath := str.Concat("/tmp/skink-stt-", str.Concat(pid,
+        str.Concat("-", str.Concat(strconv.Itoa(rand.Int()), ".wav"))))
+    txtPath := str.Concat(wavPath, ".txt")
+
+    // write the audio input
+    f, ferr := fs.Open(wavPath, "wb")
+    if str.Len(ferr.message) > 0 {
+        return "", ferr
+    }
+    f.Write(audio, audioLen)
+    f.Close()
+
+    var cmd string
+    if c.style == STYLE_WHISPER {
+        if str.Len(c.model) == 0 {
+            fs.Remove(wavPath)
+            return "", errors.New("stt: whisper provider requires a model path")
+        }
+        // -otxt writes <input>.txt; -nt drops timestamps; -np = no progress
+        cmd = str.Concat(c.bin, " -nt -np -otxt -m ")
+        cmd = str.Concat(cmd, shellEsc(c.model))
+        cmd = str.Concat(cmd, " -f ")
+        cmd = str.Concat(cmd, shellEsc(wavPath))
+        if str.Len(o.Lang) > 0 {
+            cmd = str.Concat(cmd, " -l ")
+            cmd = str.Concat(cmd, shellEsc(o.Lang))
+        }
+        txtPath = str.Concat(wavPath, ".txt")
+    } else {
+        if str.Len(c.tmpl) == 0 {
+            fs.Remove(wavPath)
+            return "", errors.New("stt: template provider has no command")
+        }
+        inTok := str.Concat("{", "in}")   // built via concat: "{in}" lexes as interpolation
+        outTok := str.Concat("{", "out}")
+        cmd = str.Replace(c.tmpl, inTok, shellEsc(wavPath))
+        cmd = str.Replace(cmd, outTok, shellEsc(txtPath))
+    }
+
+    code := os.System(cmd)
+    if code != 0 || !fs.Exists(txtPath) {
+        fs.Remove(wavPath)
+        return "", errors.New("stt: engine failed or produced no transcript")
+    }
+    data, n, rerr := readAll(txtPath)
+    fs.Remove(wavPath)
+    fs.Remove(txtPath)
+    if str.Len(rerr.message) > 0 {
+        return "", rerr
+    }
+    text := str.Substr(data, 0, n)
+    libc.free(data)
+    if c.style == STYLE_WHISPER {
+        return trimResult(text), errors.New("")
+    }
+    return str.Trim(text), errors.New("")
+}

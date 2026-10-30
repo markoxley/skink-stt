@@ -1,0 +1,52 @@
+// File:    stt_iface.skink
+// Purpose: Provider abstraction for skink-stt. Skink has no interfaces,
+//          so a Provider is a function-valued struct — each backend
+//          (REST, subprocess, custom) fills transcribeFn + State and
+//          callers dispatch uniformly via Transcribe, which takes raw
+//          audio bytes (WAV recommended) + length and returns text.
+module stt_iface
+
+import "std/errors"
+
+// Opts controls transcription. Empty fields take provider defaults.
+pub struct Opts {
+    Lang:      string  // e.g. "en", "en-US"; "" = auto-detect
+    Format:    string  // audio container hint, "wav" default
+    Prompt:    string  // optional context/style prompt (REST)
+    Timestamps: bool   // request word/segment timestamps where supported
+}
+
+// Provider is an STT backend: fn vtable + opaque state.
+pub struct Provider {
+    Name:  string
+    State: int64   // opaque backend handle
+
+    // transcribeFn(audio, audioLen, opts) -> (text, err).
+    // audio/audioLen must describe a complete audio file/image the
+    // backend understands (WAV for everything built-in).
+    transcribeFn: fn(*Provider, string, int, Opts) -> (string, errors.Error)
+
+    // Transcribe sends audio to the backend and returns text.
+    pub fn Transcribe(self: *Provider, audio: string, audioLen: int, o: Opts) -> (string, errors.Error) {
+        return self.transcribeFn(self, audio, audioLen, o)
+    }
+}
+
+// errNoTranscribe is the vtable entry for uninitialized providers.
+fn errNoTranscribe(p: *Provider, audio: string, audioLen: int, o: Opts) -> (string, errors.Error) {
+    return "", errors.New("stt: provider has no transcribe function")
+}
+
+// New returns a Provider wired to errNoTranscribe — call sites that
+// forget to install transcribeFn get a clean error, not a null jump.
+pub fn New(name: string) -> Provider {
+    var p Provider
+    p.Name = name
+    p.transcribeFn = errNoTranscribe
+    return p
+}
+
+// DefaultOpts returns sensible defaults (wav, auto language).
+pub fn DefaultOpts() -> Opts {
+    return Opts{Lang: "", Format: "wav", Prompt: "", Timestamps: false}
+}

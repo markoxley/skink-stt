@@ -1,0 +1,137 @@
+// File:    live_test.skink
+// Purpose: Live STT test — runs real providers when configured:
+//            STT_WHISPER_MODEL=<ggml bin>   → whisper.cpp (binary on PATH)
+//            STT_TEMPLATE='<cmd {in} {out}>'→ command-template provider
+//            STT_API_KEY / OPENAI_API_KEY  → OpenAI /v1/audio/transcriptions
+//            STT_BASE_URL                  → override the REST endpoint
+//          Generates a 1s sine WAV in memory and transcribes it.
+//          Self-skips when nothing is configured.
+module main
+
+import "stt"
+import "stt_iface"
+import "stt_rest"
+import "stt_proc"
+import "std/str"
+import "std/os"
+import "std/libc"
+
+// makeWav builds a tiny valid WAV in memory (8000Hz mono sine, 0.5s).
+fn makeWav() -> (string, int) {
+    n := 4000
+    total := 44 + n * 2
+    b := libc.malloc(total)
+    b[0] = 82
+    b[1] = 73
+    b[2] = 70
+    b[3] = 70
+    sz := total - 8
+    b[4] = sz & 255
+    b[5] = (sz >> 8) & 255
+    b[6] = (sz >> 16) & 255
+    b[7] = (sz >> 24) & 255
+    b[8] = 87
+    b[9] = 65
+    b[10] = 86
+    b[11] = 69
+    b[12] = 102
+    b[13] = 109
+    b[14] = 116
+    b[15] = 32
+    b[16] = 16
+    b[20] = 1
+    b[22] = 1
+    b[24] = 64
+    b[25] = 31
+    b[28] = 128
+    b[29] = 62
+    b[32] = 2
+    b[34] = 16
+    b[36] = 100
+    b[37] = 97
+    b[38] = 116
+    b[39] = 97
+    dn := n * 2
+    b[40] = dn & 255
+    b[41] = (dn >> 8) & 255
+    b[42] = (dn >> 16) & 255
+    b[43] = (dn >> 24) & 255
+    i := 44
+    sample := 0
+    for i < total {
+        // crude square-ish wave at ~200Hz so the file isn't silence
+        v := 4000
+        if (sample / 20) % 2 == 0 {
+            v = -4000
+        }
+        u := v
+        if u < 0 {
+            u = u + 65536
+        }
+        b[i] = u & 255
+        b[i + 1] = (u >> 8) & 255
+        i = i + 2
+        sample = sample + 1
+    }
+    return b, total
+}
+
+fn run(p: *stt_iface.Provider, name: string, wav: string, wavLen: int) -> int {
+    o := stt_iface.DefaultOpts()
+    o.Lang = os.Getenv("STT_LANG")
+    text, err := p.Transcribe(wav, wavLen, o)
+    if str.Len(err.message) > 0 {
+        println("FAIL: ", name, ": ", err.message)
+        return 1
+    }
+    println("OK: ", name, " → '", text, "'")
+    return 0
+}
+
+fn main() -> int {
+    fails := 0
+    ran := 0
+    wav, wavLen := makeWav()
+
+    model := os.Getenv("STT_WHISPER_MODEL")
+    if str.Len(model) > 0 && stt_proc.Available("whisper-cli") {
+        ran = ran + 1
+        p := stt_proc.Whisper(model)
+        fails = fails + run(&p, "whisper.cpp", wav, wavLen)
+    }
+
+    tmpl := os.Getenv("STT_TEMPLATE")
+    if str.Len(tmpl) > 0 {
+        ran = ran + 1
+        p := stt_proc.Template(tmpl)
+        fails = fails + run(&p, "template", wav, wavLen)
+    }
+
+    key := os.Getenv("STT_API_KEY")
+    if str.Len(key) == 0 {
+        key = os.Getenv("OPENAI_API_KEY")
+    }
+    if str.Len(key) > 0 {
+        ran = ran + 1
+        base := os.Getenv("STT_BASE_URL")
+        var p stt_iface.Provider
+        if str.Len(base) > 0 {
+            p = stt_rest.WithBase(base, key, "whisper-1")
+        } else {
+            p = stt_rest.OpenAI(key)
+        }
+        fails = fails + run(&p, "rest", wav, wavLen)
+    }
+
+    libc.free(wav)
+    if ran == 0 {
+        println("SKIP: no STT provider configured (STT_WHISPER_MODEL, STT_TEMPLATE, or STT_API_KEY)")
+        return 0
+    }
+    if fails > 0 {
+        println("FAILED: ", fails, " provider(s)")
+        return 1
+    }
+    println("PASS: stt live test (", ran, " provider(s))")
+    return 0
+}

@@ -1,0 +1,59 @@
+// File:    stt.skink
+// Purpose: Root module for skink-stt. Re-exports the provider
+//          interface plus the REST (OpenAI-compatible) and subprocess
+//          (whisper.cpp / command-template) providers so
+//          `import "stt"` is the common entry point.
+//
+//          Layers:
+//            stt_iface — Provider vtable + Opts (backend-agnostic)
+//            stt_http  — binary-safe HTTP(S) POST client
+//            stt_rest  — OpenAI-compatible transcription provider
+//            stt_proc  — whisper.cpp CLI + command-template providers
+module stt
+
+import "stt_iface"
+import "stt_rest"
+import "stt_proc"
+import "std/str"
+import "std/os"
+import "std/errors"
+
+// NewOpenAI creates a whisper-1 provider for api.openai.com.
+pub fn NewOpenAI(apiKey: string) -> stt_iface.Provider {
+    return stt_rest.OpenAI(apiKey)
+}
+
+// NewWhisper creates a whisper.cpp provider for the given model file.
+pub fn NewWhisper(model: string) -> stt_iface.Provider {
+    return stt_proc.Whisper(model)
+}
+
+// NewTemplate creates a command-template provider.
+pub fn NewTemplate(tmpl: string) -> stt_iface.Provider {
+    return stt_proc.Template(tmpl)
+}
+
+// Detect returns the first usable provider: a local whisper.cpp when
+// STT_WHISPER_MODEL is set and the binary exists, else an OpenAI
+// provider when STT_API_KEY (or OPENAI_API_KEY) is set. Name "none"
+// means nothing was found.
+pub fn Detect() -> stt_iface.Provider {
+    p := stt_proc.DetectProc()
+    if p.Name != "none" {
+        return p
+    }
+    k := os.Getenv("STT_API_KEY")
+    if str.Len(k) == 0 {
+        k = os.Getenv("OPENAI_API_KEY")
+    }
+    if str.Len(k) > 0 {
+        return stt_rest.OpenAI(k)
+    }
+    return p
+}
+
+// Transcribe sends audio bytes through a provider with default opts.
+pub fn Transcribe(p: *stt_iface.Provider, audio: string, audioLen: int) -> (string, string) {
+    text, err := p.Transcribe(audio, audioLen, stt_iface.DefaultOpts())
+    return text, err.message
+}

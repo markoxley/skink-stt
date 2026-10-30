@@ -1,0 +1,150 @@
+// File:    stt_rest.skink
+// Purpose: OpenAI-compatible REST STT provider for skink-stt. POSTs a
+//          multipart/form-data body (model + optional language/prompt
+//          fields + the audio file) to /v1/audio/transcriptions with
+//          a Bearer token, then pulls "text" from the JSON response.
+//          Works with OpenAI Whisper API and compatible endpoints.
+module stt_rest
+
+import "std/str"
+import "std/strconv"
+import "std/errors"
+import "std/libc"
+import "std/json"
+import "stt_iface"
+import "stt_http"
+
+// cfg holds provider config; boxes hold them behind Provider.State
+// (Skink can't cast int64 → *cfg — a len-1 slice gives a stable heap
+// pointer, the map key is the handle).
+struct cfg {
+    base:  string  // e.g. "https://api.openai.com"
+    key:   string
+    model: string  // e.g. "whisper-1"
+}
+
+var cfgBoxes map[int][]cfg
+var cfgNext = 1
+
+// OpenAI creates a provider for api.openai.com (model "whisper-1").
+pub fn OpenAI(apiKey: string) -> stt_iface.Provider {
+    return WithBase("https://api.openai.com", apiKey, "whisper-1")
+}
+
+// WithBase creates a provider against any OpenAI-compatible endpoint.
+pub fn WithBase(base: string, apiKey: string, model: string) -> stt_iface.Provider {
+    if cfgBoxes == nil {
+        cfgBoxes = make(map[int][]cfg)
+    }
+    s := make([]cfg, 1)
+    s[0] = cfg{base: base, key: apiKey, model: model}
+    h := cfgNext
+    cfgNext = cfgNext + 1
+    cfgBoxes[h] = s
+    p := stt_iface.New("rest")
+    p.State = int64(h)
+    p.transcribeFn = doTranscribe
+    return p
+}
+
+// cfgOf recovers the cfg behind a provider's State handle.
+fn cfgOf(p: *stt_iface.Provider) -> *cfg {
+    return &cfgBoxes[int(p.State)][0]
+}
+
+// multipart builds a multipart/form-data body (malloc'd, caller frees).
+// Parts are name/value text pairs plus one file part. Binary file
+// bytes are appended with memcpy so NULs survive.
+fn multipart(boundary: string, keys: []string, vals: []string, nFields: int,
+    fileName: string, fileData: string, fileLen: int) -> (string, int) {
+    // over-allocate: every payload byte plus a fixed allowance per
+    // part for headers/boundaries — exact bookkeeping is fragile and
+    // an underestimate corrupts the heap.
+    sz := fileLen + 512
+    for i := 0; i < nFields; i = i + 1 {
+        sz = sz + str.Len(keys[i]) + str.Len(vals[i]) + 128
+    }
+    sz = sz + str.Len(fileName) + str.Len(boundary) * (nFields + 2)
+
+    buf := libc.malloc(sz + 1)
+    off := 0
+    for i := 0; i < nFields; i = i + 1 {
+        off = off + putS(buf, off, "--")
+        off = off + putS(buf, off, boundary)
+        off = off + putS(buf, off, "\r\nContent-Disposition: form-data; name=\"")
+        off = off + putS(buf, off, keys[i])
+        off = off + putS(buf, off, "\"\r\n\r\n")
+        off = off + putS(buf, off, vals[i])
+        off = off + putS(buf, off, "\r\n")
+    }
+    off = off + putS(buf, off, "--")
+    off = off + putS(buf, off, boundary)
+    off = off + putS(buf, off, "\r\nContent-Disposition: form-data; name=\"file\"; filename=\"")
+    off = off + putS(buf, off, fileName)
+    off = off + putS(buf, off, "\"\r\nContent-Type: audio/wav\r\n\r\n")
+    libc.memcpy(string(int64(buf) + int64(off)), fileData, fileLen)
+    off = off + fileLen
+    off = off + putS(buf, off, "\r\n--")
+    off = off + putS(buf, off, boundary)
+    off = off + putS(buf, off, "--\r\n")
+    buf[off] = 0
+    return buf, off
+}
+
+// putS copies a string into buf at off; returns bytes written.
+fn putS(buf: string, off: int, s: string) -> int {
+    n := str.Len(s)
+    libc.memcpy(string(int64(buf) + int64(off)), s, n)
+    return n
+}
+
+// doTranscribe is the Provider vtable implementation.
+fn doTranscribe(p: *stt_iface.Provider, audio: string, audioLen: int, o: stt_iface.Opts) -> (string, errors.Error) {
+    cc := cfgOf(p)
+    boundary := "----skinkstt7f3a9e2b"
+
+    var keys []string
+    var vals []string
+    nf := 0
+    keys = append(keys, "model")
+    vals = append(vals, cc.model)
+    nf = nf + 1
+    if str.Len(o.Lang) > 0 {
+        keys = append(keys, "language")
+        vals = append(vals, o.Lang)
+        nf = nf + 1
+    }
+    if str.Len(o.Prompt) > 0 {
+        keys = append(keys, "prompt")
+        vals = append(vals, o.Prompt)
+        nf = nf + 1
+    }
+    keys = append(keys, "response_format")
+    vals = append(vals, "json")
+    nf = nf + 1
+
+    body, bodyLen := multipart(boundary, keys, vals, nf, "audio.wav", audio, audioLen)
+    ct := str.Concat("multipart/form-data; boundary=", boundary)
+    headers := ""
+    if str.Len(cc.key) > 0 {
+        headers = str.Concat("Authorization: Bearer ", cc.key)
+    }
+    url := str.Concat(cc.base, "/v1/audio/transcriptions")
+    resp, err := stt_http.Post(url, ct, headers, body, bodyLen)
+    libc.free(body)
+    if str.Len(err.message) > 0 {
+        return "", err
+    }
+    if resp.Status < 200 || resp.Status >= 300 {
+        libc.free(resp.Body)
+        return "", errors.New(str.Concat("stt: HTTP ", strconv.Itoa(resp.Status)))
+    }
+    v, jerr := json.Unmarshal(resp.Body)
+    if str.Len(jerr.message) > 0 {
+        libc.free(resp.Body)
+        return "", jerr
+    }
+    text := json.GetString(v, "text")
+    libc.free(resp.Body)
+    return text, errors.New("")
+}
