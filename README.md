@@ -14,8 +14,8 @@ scales add markoxley/skink-stt
 ## Quick start
 
 ```skink
-import "stt"
-import "stt_iface"
+import "mod/markoxley/skink-stt"
+import "mod/markoxley/skink-stt/stt_iface"
 
 p := stt.Detect()    // whisper.cpp if STT_WHISPER_MODEL set,
                      // else OpenAI if STT_API_KEY/OPENAI_API_KEY set
@@ -37,6 +37,8 @@ println(text)
 ## Options
 
 ```skink
+import "mod/markoxley/skink-stt/stt_iface"
+
 o := stt_iface.DefaultOpts()
 o.Lang = "en"          // language hint (auto-detect when empty)
 o.Prompt = "jargon"    // style/context prompt (REST only)
@@ -49,6 +51,8 @@ with two placeholders — `{in}` is the input WAV path (written to a
 temp file), `{out}` is where the command must write plain text:
 
 ```skink
+import "mod/markoxley/skink-stt/stt_proc"
+
 p := stt_proc.Template("python3 /opt/vosk_cli.py --wav {in} --out {out}")
 ```
 
@@ -57,6 +61,9 @@ p := stt_proc.Template("python3 /opt/vosk_cli.py --wav {in} --out {out}")
 `stt_iface.Provider` is a vtable:
 
 ```skink
+import "mod/markoxley/skink-stt/stt_iface"
+import "std/errors"
+
 fn myTr(p: *stt_iface.Provider, audio: string, audioLen: int, o: stt_iface.Opts) -> (string, errors.Error) {
     return "...", errors.New("")
 }
