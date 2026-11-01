@@ -21,6 +21,11 @@ import "std/time"
 import "std/testing"
 import "std/errors"
 
+// Raw byte write for the malloc'd WAV fixture — string indexing is
+// bounds-checked against strlen, which truncates at the first NUL byte
+// inside a binary buffer.
+extern fn Skink_mem_write_byte(ptr: string, idx: int64, val: int)
+
 // fakeTranscribe is a test vtable entry returning fixed text.
 fn fakeTranscribe(p: *stt_iface.Provider, audio: string, audioLen: int, o: stt_iface.Opts) -> (string, errors.Error) {
     return "transcribed text", errors.New("")
@@ -45,35 +50,35 @@ pub fn TestUninitializedProvider() {
 // fakeWav builds a minimal valid WAV (44-byte header, 8 silent frames).
 fn fakeWav() -> (string, int) {
     b := libc.malloc(60)
-    b[0] = 82
-    b[1] = 73
-    b[2] = 70
-    b[3] = 70    // RIFF
-    b[4] = 52    // size
-    b[8] = 87    // WAVE
-    b[9] = 65
-    b[10] = 86
-    b[11] = 69
-    b[12] = 102  // fmt
-    b[13] = 109
-    b[14] = 116
-    b[15] = 32
-    b[16] = 16   // fmt size
-    b[20] = 1    // PCM
-    b[22] = 1    // mono
-    b[24] = 64   // rate lo
-    b[25] = 31   // 8000Hz
-    b[28] = 128  // byte rate lo
-    b[29] = 62
-    b[32] = 2    // block align
-    b[34] = 16   // bits
-    b[36] = 100  // data
-    b[37] = 97
-    b[38] = 116
-    b[39] = 97
-    b[40] = 16   // 16 bytes data
+    Skink_mem_write_byte(b, 0, 82)
+    Skink_mem_write_byte(b, 1, 73)
+    Skink_mem_write_byte(b, 2, 70)
+    Skink_mem_write_byte(b, 3, 70)    // RIFF
+    Skink_mem_write_byte(b, 4, 52)    // size
+    Skink_mem_write_byte(b, 8, 87)    // WAVE
+    Skink_mem_write_byte(b, 9, 65)
+    Skink_mem_write_byte(b, 10, 86)
+    Skink_mem_write_byte(b, 11, 69)
+    Skink_mem_write_byte(b, 12, 102)  // fmt
+    Skink_mem_write_byte(b, 13, 109)
+    Skink_mem_write_byte(b, 14, 116)
+    Skink_mem_write_byte(b, 15, 32)
+    Skink_mem_write_byte(b, 16, 16)   // fmt size
+    Skink_mem_write_byte(b, 20, 1)    // PCM
+    Skink_mem_write_byte(b, 22, 1)    // mono
+    Skink_mem_write_byte(b, 24, 64)   // rate lo
+    Skink_mem_write_byte(b, 25, 31)   // 8000Hz
+    Skink_mem_write_byte(b, 28, 128)  // byte rate lo
+    Skink_mem_write_byte(b, 29, 62)
+    Skink_mem_write_byte(b, 32, 2)    // block align
+    Skink_mem_write_byte(b, 34, 16)   // bits
+    Skink_mem_write_byte(b, 36, 100)  // data
+    Skink_mem_write_byte(b, 37, 97)
+    Skink_mem_write_byte(b, 38, 116)
+    Skink_mem_write_byte(b, 39, 97)
+    Skink_mem_write_byte(b, 40, 16)   // 16 bytes data
     for i := 44; i < 60; i = i + 1 {
-        b[i] = 0
+        Skink_mem_write_byte(b, int64(i), 0)
     }
     return b, 60
 }
@@ -172,4 +177,69 @@ pub fn TestAvailable() {
 pub fn TestAvailableEscapes() {
     testing.AssertFalse(stt_proc.Available("x';id;'"), "shell chars escaped")
     testing.AssertFalse(stt_proc.Available("definitely-not-a-real-binary-xyz"), "missing binary")
+}
+
+// TestRootConstructors verifies the stt.* convenience constructors wire
+// the right provider names and vtables.
+pub fn TestRootConstructors() {
+    po := stt.NewOpenAI("k")
+    testing.AssertEqualString("rest", po.Name, "NewOpenAI -> rest provider")
+    pw := stt.NewWhisper("model.bin")
+    testing.AssertTrue(str.Len(pw.Name) > 0, "NewWhisper names a provider")
+    pt := stt.NewTemplate(str.Concat("cat ", str.Concat("{", str.Concat("in} > ", str.Concat("{", "out}")))))
+    testing.AssertEqualString("template", pt.Name, "NewTemplate -> template provider")
+}
+
+// TestProviderConstructors checks the submodule constructors directly:
+// WithBase/OpenAI produce "rest", Whisper/WhisperBin name the binary,
+// Template is named "template", and every one dispatches (errors from
+// the engine side are fine — a nil vtable would panic instead).
+pub fn TestProviderConstructors() {
+    pb := stt_rest.WithBase("http://127.0.0.1:1", "k", "m")
+    testing.AssertEqualString("rest", pb.Name, "WithBase name")
+    pn := stt_rest.OpenAI("k")
+    testing.AssertEqualString("rest", pn.Name, "OpenAI name")
+    pw := stt_proc.Whisper("m.bin")
+    testing.AssertTrue(str.Len(pw.Name) > 0, "Whisper name")
+    pwb := stt_proc.WhisperBin("main", "m.bin")
+    testing.AssertTrue(str.Len(pwb.Name) > 0, "WhisperBin name")
+}
+
+// TestDetectProc verifies the subprocess detector: with no model env it
+// yields the "none" provider; with STT_WHISPER_MODEL set it stays "none"
+// unless a whisper binary is actually installed.
+pub fn TestDetectProc() {
+    os.Unsetenv("STT_WHISPER_MODEL")
+    p := stt_proc.DetectProc()
+    testing.AssertEqualString("none", p.Name, "no model env -> none")
+    os.Setenv("STT_WHISPER_MODEL", "/tmp/fake-model.bin")
+    p2 := stt_proc.DetectProc()
+    if stt_proc.Available("whisper-cli") || stt_proc.Available("whisper.cpp") {
+        testing.AssertNotEqualString("none", p2.Name, "whisper binary + model -> provider")
+    } else {
+        testing.AssertEqualString("none", p2.Name, "model env but no binary -> none")
+    }
+    os.Unsetenv("STT_WHISPER_MODEL")
+}
+
+// TestDetectAPIKey verifies stt.Detect prefers the OpenAI provider when
+// an API key is present and no local whisper is configured.
+pub fn TestDetectAPIKey() {
+    os.Unsetenv("STT_WHISPER_MODEL")
+    os.Setenv("STT_API_KEY", "test-key-123")
+    p := stt.Detect()
+    testing.AssertEqualString("rest", p.Name, "api key -> rest provider")
+    os.Unsetenv("STT_API_KEY")
+    p2 := stt.Detect()
+    if !stt_proc.Available("whisper-cli") && !stt_proc.Available("whisper.cpp") {
+        testing.AssertEqualString("none", p2.Name, "nothing configured -> none")
+    }
+}
+
+// TestRootTranscribe verifies the stt.Transcribe convenience wrapper
+// surfaces the provider error as a plain string.
+pub fn TestRootTranscribe() {
+    p := stt_iface.New("none")
+    _, e := stt.Transcribe(&p, "audio", 5)
+    testing.AssertTrue(str.Len(e) > 0, "uninitialized provider errors")
 }

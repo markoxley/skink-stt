@@ -17,6 +17,10 @@ import "stt_iface"
 
 extern fn getpid() -> int
 
+// Raw byte write for malloc'd buffers — string indexing is bounds-checked
+// against strlen, which cannot address positions inside binary data.
+extern fn Skink_mem_write_byte(ptr: string, idx: int64, val: int)
+
 // pcfg holds subprocess provider config behind Provider.State.
 struct pcfg {
     style: int      // 0=whisper-cli, 1=template
@@ -123,7 +127,7 @@ fn readAll(path: string) -> (string, int, errors.Error) {
         got = got + n
     }
     f.Close()
-    data[got] = 0
+    Skink_mem_write_byte(data, int64(got), 0)
     return data, got, errors.New("")
 }
 

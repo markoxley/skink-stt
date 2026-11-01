@@ -14,6 +14,11 @@ import "std/json"
 import "stt_iface"
 import "stt_http"
 
+// Raw byte write for the malloc'd multipart body — string indexing is
+// bounds-checked against strlen, which is meaningless on a buffer still
+// being constructed.
+extern fn Skink_mem_write_byte(ptr: string, idx: int64, val: int)
+
 // cfg holds provider config; boxes hold them behind Provider.State
 // (Skink can't cast int64 → *cfg — a len-1 slice gives a stable heap
 // pointer, the map key is the handle).
@@ -87,7 +92,7 @@ fn multipart(boundary: string, keys: []string, vals: []string, nFields: int,
     off = off + putS(buf, off, "\r\n--")
     off = off + putS(buf, off, boundary)
     off = off + putS(buf, off, "--\r\n")
-    buf[off] = 0
+    Skink_mem_write_byte(buf, int64(off), 0)
     return buf, off
 }
 
